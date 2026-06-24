@@ -10,6 +10,7 @@ import codecs
 import json
 import logging
 import os
+import platform
 import select
 import shlex
 import subprocess
@@ -24,6 +25,7 @@ from hermes_constants import get_hermes_home
 from tools.interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
+_IS_WINDOWS = platform.system() == "Windows"
 
 # Opt-in debug tracing for the interrupt/activity/poll machinery.  Set
 # HERMES_DEBUG_INTERRUPT=1 to log loop entry/exit, periodic heartbeats, and
@@ -314,9 +316,13 @@ class BaseEnvironment(ABC):
         self.env = env or {}
 
         self._session_id = uuid.uuid4().hex[:12]
-        temp_dir = self.get_temp_dir().rstrip("/") or "/"
-        self._snapshot_path = f"{temp_dir}/hermes-snap-{self._session_id}.sh"
-        self._cwd_file = f"{temp_dir}/hermes-cwd-{self._session_id}.txt"
+        # Python uses Windows path (for open(), unlink()).
+        # Bash uses the path returned by get_temp_dir() (which may be
+        # /mnt/c/... on WSL). Both paths point to the same file, just
+        # expressed in the filesystem dialect each side understands.
+        win_temp_dir = self.get_temp_dir().rstrip("/") or "/"
+        self._snapshot_path = f"{win_temp_dir}/hermes-snap-{self._session_id}.sh"
+        self._cwd_file = f"{win_temp_dir}/hermes-cwd-{self._session_id}.txt"
         self._cwd_marker = _cwd_marker(self._session_id)
         self._snapshot_ready = False
 
@@ -367,8 +373,17 @@ class BaseEnvironment(ABC):
         # caused ``C:/Users/.../hermes-snap-*.sh: No such file or directory``
         # errors on Windows, leaking via stderr (merged into stdout on Linux
         # backends) into every terminal-tool response.
-        _quoted_snap = shlex.quote(self._snapshot_path)
-        _quoted_cwd_file = shlex.quote(self._cwd_file)
+        # When bash is WSL, the snapshot + cwd-file paths must be in
+        # /mnt/c/... form because Python wrote them in Windows form.
+        try:
+            from tools.environments.local import _is_wsl_bash, _windows_to_wsl_path
+            _wsl_init = _IS_WINDOWS and _is_wsl_bash()
+        except Exception:
+            _wsl_init = False
+        _init_snap = _windows_to_wsl_path(self._snapshot_path) if _wsl_init else self._snapshot_path
+        _init_cwd_file = _windows_to_wsl_path(self._cwd_file) if _wsl_init else self._cwd_file
+        _quoted_snap = shlex.quote(_init_snap)
+        _quoted_cwd_file = shlex.quote(_init_cwd_file)
         bootstrap = (
             f"export -p > {_quoted_snap}\n"
             f"declare -f | grep -vE '^_[^_]' >> {_quoted_snap}\n"
@@ -403,6 +418,27 @@ class BaseEnvironment(ABC):
     # Command wrapping
     # ------------------------------------------------------------------
 
+    def _bash_cwd_for_cmd(self, cwd: str) -> str:
+        """Translate ``cwd`` to the form bash can ``cd`` into.
+    
+        On Windows + WSL bash, the cwd we store is in Windows form
+        (``C:\\Users\\x``) so Python's ``os.path.isdir`` and ``open()`` can
+        find it. But WSL bash (real Linux) needs ``/mnt/c/Users/x`` -- it
+        doesn't recognise ``C:\\...`` as a valid path. Git Bash (MSYS)
+        auto-translates both forms, so the conversion is a no-op there.
+    
+        For the bash command itself, ``_wrap_command`` calls this before
+        formatting the ``builtin cd`` line, so bash sees the right path
+        regardless of the platform.
+        """
+        try:
+            from tools.environments.local import _is_wsl_bash, _windows_to_wsl_path
+            if _IS_WINDOWS and _is_wsl_bash():
+                return _windows_to_wsl_path(cwd)
+        except Exception:
+            pass
+        return cwd
+
     @staticmethod
     def _quote_cwd_for_cd(cwd: str) -> str:
         """Quote a ``cd`` target while preserving ``~`` expansion."""
@@ -414,17 +450,32 @@ class BaseEnvironment(ABC):
             return f"$HOME/{shlex.quote(cwd[2:])}"
         return shlex.quote(cwd)
 
+
     def _wrap_command(self, command: str, cwd: str) -> str:
         """Build the full bash script that sources snapshot, cd's, runs command,
         re-dumps env vars, and emits CWD markers."""
         escaped = command.replace("'", "'\\''")
 
-        # Quote the snapshot / cwd-file paths so Git Bash on Windows handles
-        # ``C:/Users/...``-shaped paths without glob-splitting the colon or
-        # tripping on drive letters.  POSIX paths are unaffected.  See
-        # :meth:`init_session` for the same fix on the bootstrap block.
-        _quoted_snap = shlex.quote(self._snapshot_path)
-        _quoted_cwd_file = shlex.quote(self._cwd_file)
+        # When bash is WSL (real Linux), the snapshot + cwd-file paths must
+        # be in /mnt/c/... form because Python wrote them in Windows form.
+        # For Git Bash (MSYS), the Windows paths work natively because MSYS
+        # auto-translates ``C:/...``. The local backend's _run_bash handles
+        # cwd translation; here we just need to point bash at the right
+        # filesystem location.
+        try:
+            from tools.environments.local import _is_wsl_bash, _windows_to_wsl_path
+            _wsl = _IS_WINDOWS and _is_wsl_bash()
+        except Exception:
+            _wsl = False
+        if _wsl:
+            _bash_snap = _windows_to_wsl_path(self._snapshot_path)
+            _bash_cwd_file = _windows_to_wsl_path(self._cwd_file)
+        else:
+            _bash_snap = self._snapshot_path
+            _bash_cwd_file = self._cwd_file
+
+        _quoted_snap = shlex.quote(_bash_snap)
+        _quoted_cwd_file = shlex.quote(_bash_cwd_file)
 
         parts = []
 
@@ -441,7 +492,7 @@ class BaseEnvironment(ABC):
 
         # Preserve bare ``~`` expansion, but rewrite ``~/...`` through
         # ``$HOME`` so suffixes with spaces remain a single shell word.
-        quoted_cwd = self._quote_cwd_for_cd(cwd)
+        quoted_cwd = self._quote_cwd_for_cd(self._bash_cwd_for_cmd(cwd))
         # ``--`` keeps hyphen-prefixed directory names from being parsed as options.
         parts.append(f"builtin cd -- {quoted_cwd} || exit 126")
 

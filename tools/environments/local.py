@@ -40,6 +40,85 @@ def _msys_to_windows_path(cwd: str) -> str:
     return f"{drive}:{tail or chr(92)}"  # chr(92) = backslash, avoid raw-string escape
 
 
+def _is_wsl_bash() -> bool:
+    """Return True if the bash we're using is WSL (real Linux), not Git Bash.
+
+    WSL bash uses Linux path semantics: ``C:/Users/x`` is NOT a valid path,
+    and ``/c/Users/x`` is also invalid. The only correct form is
+    ``/mnt/c/Users/x``. Git Bash (MSYS) accepts both ``/c/Users/x`` and
+    ``C:/Users/x`` natively, so no translation is needed for it.
+
+    Detection: check the WSL_DISTRO_NAME env var that WSL's launcher exports
+    to the bash subprocess. Falls back to running ``uname -r`` which on WSL
+    includes ``microsoft-standard`` in the kernel string.
+    """
+    if not _IS_WINDOWS:
+        return False
+    if os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    bash = _find_bash() if "_find_bash" in globals() else None
+    if not bash:
+        return False
+    try:
+        r = subprocess.run(
+            [bash, "-c", "uname -r 2>/dev/null"],
+            capture_output=True, timeout=5,
+            env={
+                "PATH": "C:/Windows/System32;C:/Windows;C:/Windows/System32/Wbem;C:/Windows/System32/drivers",
+                "SYSTEMROOT": "C:/Windows",
+                "WSL_DISTRO_NAME": os.environ.get("WSL_DISTRO_NAME", ""),
+            },
+        )
+        return b"microsoft-standard" in r.stdout.lower() or b"microsoft" in r.stdout.lower()
+    except Exception:
+        return False
+
+
+def _windows_to_wsl_path(win_path: str) -> str:
+    """Convert a Windows path (``C:\\Users\\x`` or ``C:/Users/x``) to the
+    WSL form (``/mnt/c/Users/x``) so a real Linux bash can access it.
+
+    Only meaningful when the bash we're using is WSL. On Git Bash, MSYS
+    auto-translates ``C:/...`` to ``/c/...``, so this is a no-op.
+
+    No-ops on non-Windows hosts or paths that aren't already Windows-shaped
+    (no drive letter, e.g. a POSIX path returned from bash itself).
+    """
+    if not _IS_WINDOWS or not win_path:
+        return win_path
+    # Already in WSL form? Pass through.
+    if win_path.startswith("/mnt/") or win_path.startswith("/"):
+        return win_path
+    # Windows-shaped: "C:/...", "C:\...", "C:..."
+    m = re.match(r'^([a-zA-Z]):[/\\](.*)$', win_path)
+    if not m:
+        return win_path
+    drive = m.group(1).lower()
+    tail = m.group(2).replace('\\', '/')
+    return f"/mnt/{drive}/{tail}"
+
+
+def _wsl_to_windows_path(wsl_path: str) -> str:
+    """Convert a WSL path (``/mnt/c/Users/x``) to Windows form (``C:\\Users\\x``).
+
+    Inverse of :func:`_windows_to_wsl_path`. Used to translate paths that came
+    from a WSL bash subprocess (like ``pwd -P`` output) back into Windows
+    form so that Python's ``os.path.isdir``, ``open()``, and Popen's
+    ``cwd=`` can find the same physical file.
+
+    No-ops on non-WSL paths (anything not starting with ``/mnt/``) and on
+    non-Windows hosts.
+    """
+    if not _IS_WINDOWS or not wsl_path:
+        return wsl_path
+    m = re.match(r'^/mnt/([a-zA-Z])(/.*)?$', wsl_path)
+    if not m:
+        return wsl_path
+    drive = m.group(1).upper()
+    tail = (m.group(2) or "").replace("/", "\\")
+    return f"{drive}:{tail or chr(92)}"
+
+
 def _resolve_safe_cwd(cwd: str) -> str:
     """Return ``cwd`` if it exists as a directory, else the nearest existing
     ancestor.  Falls back to ``tempfile.gettempdir()`` only if walking up the
@@ -47,9 +126,10 @@ def _resolve_safe_cwd(cwd: str) -> str:
     filesystem, but cheap belt-and-braces).
 
     On Windows, also normalizes Git Bash / MSYS-style POSIX paths
-    (``/c/Users/x``) to native Windows form before the isdir check so a
-    perfectly valid ``pwd -P`` result from bash doesn't get rejected as
-    "missing" (see ``_msys_to_windows_path``).
+    (``/c/Users/x``) and WSL paths (``/mnt/c/Users/x``) to native Windows
+    form before the isdir check so a perfectly valid cwd coming from bash
+    doesn't get rejected as "missing" (see ``_msys_to_windows_path`` and
+    ``_wsl_to_windows_path``).
 
     Used by ``_run_bash`` to recover when the configured cwd is gone — most
     commonly because a previous tool call deleted its own working directory
@@ -57,12 +137,31 @@ def _resolve_safe_cwd(cwd: str) -> str:
     raises ``FileNotFoundError`` before bash starts, wedging every subsequent
     terminal call until the gateway restarts.
     """
-    cwd = _msys_to_windows_path(cwd) if _IS_WINDOWS else cwd
-    if cwd and os.path.isdir(cwd):
+    if _IS_WINDOWS:
+        # WSL paths first (more specific: /mnt/c/...) then MSYS (/c/...).
+        # The functions are no-ops when the path doesn't match their
+        # pattern, so the order doesn't matter for non-Windows paths.
+        cwd = _wsl_to_windows_path(cwd)
+        cwd = _msys_to_windows_path(cwd)
+
+    # On Windows, ``os.path.isdir('/')`` returns False even when the
+    # underlying mount exists because POSIX ``/`` doesn't translate to a
+    # Windows path. So we probe BOTH forms (the POSIX ``/`` and the
+    # native ``os.sep``) — if either is a valid directory, the path is
+    # valid. This keeps the WSL happy-path working without breaking
+    # tests that explicitly mock ``os.path.isdir`` to ``lambda p: False``.
+    def _isdir(p):
+        if os.path.isdir(p):
+            return True
+        if _IS_WINDOWS and p == "/" and os.path.isdir(os.sep):
+            return True
+        return False
+
+    if cwd and _isdir(cwd):
         return cwd
     parent = os.path.dirname(cwd) if cwd else ""
     while parent:
-        if os.path.isdir(parent):
+        if _isdir(parent):
             return parent
         next_parent = os.path.dirname(parent)
         if next_parent == parent:
@@ -245,45 +344,80 @@ def _find_bash() -> str:
             or "/bin/sh"
         )
 
+    # User override always wins.
     custom = os.environ.get("HERMES_GIT_BASH_PATH")
     if custom and os.path.isfile(custom):
         return custom
 
-    # Prefer our own portable Git install first — this way a broken or
-    # partially-uninstalled system Git can't hijack the bash lookup.  The
-    # install.ps1 installer always drops portable Git here when the user
-    # didn't already have a working system Git.
-    #
-    # Layouts (both checked so upgrades between MinGit and PortableGit
-    # installs work transparently):
-    #   PortableGit: %LOCALAPPDATA%\hermes\git\bin\bash.exe   (primary)
-    #   MinGit:      %LOCALAPPDATA%\hermes\git\usr\bin\bash.exe (legacy/32-bit fallback)
+    # On Windows: probe each candidate with a 5s smoke test ("echo bash-ok").
+    # The MinGit stub at %LOCALAPPDATA%\hermes\git\bin\bash.exe is a 47KB
+    # wrapper that **hangs** when it inherits too many env vars (the
+    # "internal error reading the windows environment" fatal-error class),
+    # even though `os.path.isfile` and `os.access` say it's fine. We
+    # previously returned the first file we found and only discovered the
+    # hang when terminal-tool calls timed out — which left bash.exe
+    # orphans that accumulated to 30+ processes on the user's machine.
+    # The probe catches the hang and falls through to a working candidate.
+    def _bash_works(path: str) -> bool:
+        # Use a minimal env so we don't hit the "too many environment
+        # variables" hang, and skip the user's PATH (which itself may
+        # reference bash.exe, causing recursion).  Include the Windows
+        # system32 directories WSL bash needs to find its service entrypoint.
+        minimal_env = {
+            "PATH": "C:/Windows/System32;C:/Windows;C:/Windows/System32/Wbem;C:/Windows/System32/drivers",
+            "SYSTEMROOT": "C:/Windows",
+            "COMSPEC": "C:/Windows/System32/cmd.exe",
+            "TEMP": "C:/Windows/Temp",
+            "TMP": "C:/Windows/Temp",
+        }
+        try:
+            r = subprocess.run(
+                [path, "-c", "echo bash-ok"],
+                capture_output=True, timeout=10,
+                env=minimal_env,
+            )
+            # bash.exe may emit UTF-16 on stdout (UTF-16LE with BOM) for some
+            # error paths. Try UTF-8 first, then UTF-16, and look for the
+            # substring in either decoded form. `errors="replace"` so a
+            # failed decode doesn't crash the probe.
+            for enc in ("utf-8", "utf-16-le"):
+                try:
+                    text = r.stdout.decode(enc, errors="replace")
+                    if "bash-ok" in text:
+                        return True
+                except (UnicodeDecodeError, LookupError):
+                    continue
+            return r.returncode == 0 and r.stdout and len(r.stdout) < 200
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return False
+
+    # Prefer Hermes git bash if it works.
     _local_appdata = os.environ.get("LOCALAPPDATA", "")
     _hermes_portable_git = os.path.join(_local_appdata, "hermes", "git") if _local_appdata else ""
     if _hermes_portable_git:
         for candidate in (
-            os.path.join(_hermes_portable_git, "bin", "bash.exe"),        # PortableGit (primary)
-            os.path.join(_hermes_portable_git, "usr", "bin", "bash.exe"), # MinGit fallback
+            os.path.join(_hermes_portable_git, "usr", "bin", "bash.exe"), # MinGit full bash (2.4MB)
+            os.path.join(_hermes_portable_git, "bin", "bash.exe"),        # PortableGit (47KB stub may be broken)
         ):
-            if os.path.isfile(candidate):
+            if os.path.isfile(candidate) and _bash_works(candidate):
                 return candidate
 
-    found = shutil.which("bash")
-    if found:
-        return found
-
+    # Fallback: any bash on PATH or known system locations.
     for candidate in (
+        shutil.which("bash"),                                          # first on PATH
         os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin", "bash.exe"),
         os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Git", "bin", "bash.exe"),
         os.path.join(_local_appdata, "Programs", "Git", "bin", "bash.exe"),
+        r"C:\Windows\System32\bash.exe",                              # WSL bash fallback
     ):
-        if candidate and os.path.isfile(candidate):
+        if candidate and os.path.isfile(candidate) and _bash_works(candidate):
             return candidate
 
     raise RuntimeError(
-        "Git Bash not found. Hermes Agent requires Git for Windows on Windows.\n"
+        "No working bash found. Tried all known locations and none passed the smoke test.\n"
+        "Hermes Agent requires Git for Windows on Windows.\n"
         "Install it from: https://git-scm.com/download/win\n"
-        "Or set HERMES_GIT_BASH_PATH to your bash.exe location."
+        "Or set HERMES_GIT_BASH_PATH to a working bash.exe location."
     )
 
 
@@ -579,7 +713,15 @@ class LocalEnvironment(BaseEnvironment):
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
         if cwd:
             cwd = os.path.expanduser(cwd)
-        super().__init__(cwd=cwd or os.getcwd(), timeout=timeout, env=env)
+        # Resolve cwd to the nearest existing directory BEFORE init_session()
+        # spawns bash. Without this guard, the bash process can't cd into the
+        # configured directory (e.g. `/tmp` on Windows falls through to `/`,
+        # then bash can't find its snapshot file) and the session initialization
+        # fails silently — every subsequent execute() then hangs on a missing
+        # cwd. _resolve_safe_cwd handles MSYS→Windows translation + walk-up
+        # + tempfile.gettempdir() fallback all in one place.
+        resolved = _resolve_safe_cwd(cwd) if cwd else _resolve_safe_cwd(os.getcwd())
+        super().__init__(cwd=resolved or os.getcwd(), timeout=timeout, env=env)
         self.init_session()
 
     def get_temp_dir(self) -> str:
@@ -607,13 +749,20 @@ class LocalEnvironment(BaseEnvironment):
             # command interpolations AND in Python ``open()`` — Windows
             # accepts forward slashes in filesystem paths, and we control
             # the path so we can guarantee no spaces.
+            #
+            # The path returned here is in Windows form (e.g.
+            # ``C:/Users/x/.hermes/cache/terminal``) so Python's ``open()``
+            # and ``os.unlink()`` can use it. Callers that need the form
+            # bash understands (e.g. ``/mnt/c/Users/...`` for WSL bash)
+            # should use :meth:`_bash_path` or call
+            # ``_windows_to_wsl_path`` directly. Git Bash (MSYS) accepts
+            # both forms natively, so no translation is needed for it.
             try:
                 from hermes_constants import get_hermes_home
                 cache_dir = get_hermes_home() / "cache" / "terminal"
             except Exception:
                 cache_dir = Path(tempfile.gettempdir()) / "hermes_terminal"
             cache_dir.mkdir(parents=True, exist_ok=True)
-            # Force forward slashes so the same string serves both contexts.
             return str(cache_dir).replace("\\", "/")
 
         for env_var in ("TMPDIR", "TMP", "TEMP"):
@@ -644,7 +793,6 @@ class LocalEnvironment(BaseEnvironment):
             init_files = _resolve_shell_init_files()
             if init_files:
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
-        args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
         run_env = _make_run_env(self.env)
 
         # Recover when the cwd has been deleted out from under us — usually by
@@ -672,9 +820,43 @@ class LocalEnvironment(BaseEnvironment):
                 )
             self.cwd = safe_cwd
 
+        # On Windows + WSL bash: the Windows API path that Popen accepts
+        # (e.g. ``C:\Users\x``) is what bash sees as ``/mnt/c/Users/x`` after
+        # WSL auto-mount, but a literal ``C:/Users/x`` (with forward slashes)
+        # in the bash command itself is invalid. Popen passes its ``cwd=``
+        # to the OS as a native Windows path; bash then receives a working
+        # directory in /mnt/c form. We pass the native Windows path to
+        # Popen and convert to /mnt/c form for the bash command.
         _popen_cwd = self.cwd
+        _bash_cwd = (
+            _windows_to_wsl_path(self.cwd)
+            if (_IS_WINDOWS and _is_wsl_bash())
+            else self.cwd
+        )
 
-        _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+        # On Windows: use CREATE_NEW_PROCESS_GROUP so the bash.exe process and
+        # its children form a killable group via taskkill /T /F. Without this
+        # flag, bash.exe shares its parent's process group (no setsid on
+        # Windows) and only the wrapper shell gets the terminate signal —
+        # grandchildren like MSYS-bash survive as orphans and accumulate
+        # across terminal-tool invocations.
+        _popen_kwargs: dict = {}
+        # Substitute the WSL-form cwd into the bash command when bash is WSL.
+        # The cmd_string may not mention cwd at all (e.g. init_session's
+        # bootstrap), in which case this is a no-op — bash uses Popen's
+        # cwd as its starting directory. The bash ``cd`` builtin handles
+        # ``/mnt/c/...`` paths cleanly.
+        if _bash_cwd != self.cwd:
+            cmd_string = f'cd "{_bash_cwd}" 2>/dev/null || true\n' + cmd_string
+        # args must always be assigned for the Popen call below.
+        args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
+        if _IS_WINDOWS:
+            _popen_kwargs["creationflags"] = (
+                windows_hide_flags() | subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+            _popen_kwargs["start_new_session"] = False  # already in own group
+        else:
+            _popen_kwargs["preexec_fn"] = os.setsid
 
         proc = subprocess.Popen(
             args,
@@ -685,7 +867,6 @@ class LocalEnvironment(BaseEnvironment):
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-            preexec_fn=None if _IS_WINDOWS else os.setsid,
             cwd=_popen_cwd,
             **_popen_kwargs,
         )
@@ -732,38 +913,52 @@ class LocalEnvironment(BaseEnvironment):
                 pass
             return not _group_alive(pgid)
 
-        try:
-            if _IS_WINDOWS:
-                proc.terminate()
-            else:
+        if _IS_WINDOWS:
+            # Windows: use taskkill /F /T to kill the process tree. proc.terminate()
+            # only sends a console-close signal to the wrapper, which doesn't
+            # propagate to MSYS-bash children — that's why bash.exe processes
+            # were accumulating as orphans across terminal-tool invocations.
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    capture_output=True, timeout=5,
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                # Fallback if taskkill isn't available — best effort
                 try:
-                    pgid = os.getpgid(proc.pid)
-                except ProcessLookupError:
-                    pgid = getattr(proc, "_hermes_pgid", None)
-                    if pgid is None:
-                        raise
-
-                try:
-                    os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok — POSIX process-group SIGTERM (guarded by _IS_WINDOWS above)
-                except ProcessLookupError:
-                    return
-
-                # Wait on the process group, not just the shell wrapper. Under
-                # load the wrapper can exit before grandchildren do; returning
-                # at that point leaves orphaned process-group members behind.
-                if _wait_for_group_exit(pgid, 1.0):
-                    return
-
-                try:
-                    # POSIX-only: _IS_WINDOWS is handled by the outer branch.
-                    os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok — POSIX process-group SIGKILL
-                except ProcessLookupError:
-                    return
-                _wait_for_group_exit(pgid, 2.0)
-                try:
-                    proc.wait(timeout=0.2)
-                except (subprocess.TimeoutExpired, OSError):
+                    proc.terminate()
+                except Exception:
                     pass
+            return
+
+        try:
+            try:
+                pgid = os.getpgid(proc.pid)
+            except ProcessLookupError:
+                pgid = getattr(proc, "_hermes_pgid", None)
+                if pgid is None:
+                    raise
+
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except ProcessLookupError:
+                return
+
+            # Wait on the process group, not just the shell wrapper. Under
+            # load the wrapper can exit before grandchildren do; returning
+            # at that point leaves orphaned process-group members behind.
+            if _wait_for_group_exit(pgid, 1.0):
+                return
+
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+            _wait_for_group_exit(pgid, 2.0)
+            try:
+                proc.wait(timeout=0.2)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
         except (ProcessLookupError, PermissionError, OSError):
             try:
                 proc.kill()

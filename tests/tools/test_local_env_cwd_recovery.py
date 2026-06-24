@@ -47,9 +47,19 @@ class TestResolveSafeCwd:
         """If every ancestor except the filesystem root is gone, the root
         itself is still a valid recovery target — don't skip it just because
         ``os.path.dirname('/') == '/'`` is the loop's exit condition."""
-        sep = os.path.sep
-        monkeypatch.setattr(os.path, "isdir", lambda p: p == sep)
-        assert _resolve_safe_cwd("/no/such/deep/dir") == sep
+        # On Windows, ``os.sep`` is ``\\`` but the canonical "root" passed
+        # to ``_resolve_safe_cwd`` is typically ``/`` (POSIX form, e.g. from
+        # a WSL ``pwd -P``). Mock isdir so BOTH forms resolve as "valid".
+        # The implementation accepts ``/`` as a synonym for the root even
+        # on Windows (where ``os.path.isdir('/')`` returns False) so the
+        # function's own logic must check this — without that synonym the
+        # loop would exit on ``dirname('/') == '/'`` and never probe the
+        # root itself.
+        sep = os.sep
+        def mock_isdir(p):
+            return p == sep or p == "/"
+        monkeypatch.setattr(os.path, "isdir", mock_isdir)
+        assert _resolve_safe_cwd("/no/such/deep/dir") == "/"
 
 
 def _fake_interrupt():
